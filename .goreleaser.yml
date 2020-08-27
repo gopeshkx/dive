@@ -1,8 +1,10 @@
 release:
-  prerelease: true
+  prerelease: false
 
 builds:
   - binary: dive
+    env:
+      - CGO_ENABLED=0
     goos:
       - windows
       - darwin
@@ -11,37 +13,38 @@ builds:
       - amd64
     ldflags: -s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.buildTime={{.Date}}`.
 
+brews:
+  - github:
+      owner: wagoodman
+      name: homebrew-dive
+    homepage: "https://github.com/wagoodman/dive/"
+    description: "A tool for exploring each layer in a docker image"
+
+archives:
+  - format: tar.gz
+    format_overrides:
+      - goos: windows
+        format: zip
+
+nfpms:
+  - license: MIT
+    maintainer: Alex Goodman
+    homepage: https://github.com/wagoodman/dive/
+    description: "A tool for exploring each layer in a docker image"
+    formats:
+      - rpm
+      - deb
+
 dockers:
   -
-    binary: dive
+    binaries:
+      - dive
+    dockerfile: Dockerfile
+    # todo: on 1.0 remove 'v' prefix
     image_templates:
-    - "wagoodman/dive:{{ .Tag }}"
-    - "wagoodman/dive:v{{ .Major }}"
-    - "wagoodman/dive:v{{ .Major }}.{{ .Minor }}"
-    - "wagoodman/dive:latest"
-    - "quay.io/wagoodman/dive:{{ .Tag }}"
-    - "quay.io/wagoodman/dive:v{{ .Major }}"
-    - "quay.io/wagoodman/dive:v{{ .Major }}.{{ .Minor }}"
-    - "quay.io/wagoodman/dive:latest"
-
-archive:
-  format: tar.gz
-
-  format_overrides:
-    - goos: windows
-      format: zip
-
-nfpm:
-  license: MIT
-  maintainer: Alex Goodman
-  homepage: https://github.com/wagoodman/dive/
-  formats:
-    - deb
-    - rpm
-
-brew:
-  github:
-    owner: wagoodman
-    name: homebrew-dive
-  homepage: "https://github.com/wagoodman/dive/"
-  description: "A tool for exploring each layer in a docker image"
+      - "wagoodman/dive:latest"
+      - "wagoodman/dive:{{ .Tag }}"
+      - "wagoodman/dive:v{{ .Major }}"
+      - "wagoodman/dive:v{{ .Major }}.{{ .Minor }}"
+    build_flag_templates:
+      - "--build-arg=DOCKER_CLI_VERSION={{.Env.DOCKER_CLI_VERSION}}"

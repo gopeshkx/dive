@@ -3,128 +3,157 @@ package runtime
 import (
 	"fmt"
 	"github.com/dustin/go-humanize"
-	"github.com/logrusorgru/aurora"
-	"github.com/wagoodman/dive/filetree"
-	"github.com/wagoodman/dive/image"
+	"github.com/sirupsen/logrus"
+	"github.com/spf13/afero"
+	"github.com/wagoodman/dive/dive"
+	"github.com/wagoodman/dive/dive/filetree"
+	"github.com/wagoodman/dive/dive/image"
 	"github.com/wagoodman/dive/runtime/ci"
-	"github.com/wagoodman/dive/ui"
+	"github.com/wagoodman/dive/runtime/export"
+	"github.com/wagoodman/dive/runtime/ui"
 	"github.com/wagoodman/dive/utils"
-	"io/ioutil"
-	"log"
 	"os"
-	"strconv"
+	"time"
 )
 
-func title(s string) string {
-	return aurora.Bold(s).String()
-}
+func run(enableUi bool, options Options, imageResolver image.Resolver, events eventChannel, filesystem afero.Fs) {
+	var img *image.Image
+	var err error
+	defer close(events)
 
-func runCi(analysis *image.AnalysisResult, options Options) {
-	fmt.Printf("  efficiency: %2.4f %%\n", analysis.Efficiency*100)
-	fmt.Printf("  wastedBytes: %d bytes (%s)\n", analysis.WastedBytes, humanize.Bytes(analysis.WastedBytes))
-	fmt.Printf("  userWastedPercent: %2.4f %%\n", analysis.WastedUserPercent*100)
+	doExport := options.ExportFile != ""
+	doBuild := len(options.BuildArgs) > 0
 
-	fmt.Println(title("Run CI Validations..."))
-	evaluator := ci.NewEvaluator()
-
-	err := evaluator.LoadConfig(options.CiConfigFile)
-	if err != nil {
-		fmt.Println("  Using default CI config")
+	if doBuild {
+		events.message(utils.TitleFormat("Building image..."))
+		img, err = imageResolver.Build(options.BuildArgs)
+		if err != nil {
+			events.exitWithErrorMessage("cannot build image", err)
+			return
+		}
 	} else {
-		fmt.Printf("  Using CI config: %s\n", options.CiConfigFile)
+		events.message(utils.TitleFormat("Image Source: ") + options.Source.String() + "://" + options.Image)
+		events.message(utils.TitleFormat("Fetching image...") + " (this can take a while for large images)")
+		img, err = imageResolver.Fetch(options.Image)
+		if err != nil {
+			events.exitWithErrorMessage("cannot fetch image", err)
+			return
+		}
 	}
 
-	pass := evaluator.Evaluate(analysis)
-	evaluator.Report()
-
-	if pass {
-		utils.Exit(0)
-	}
-	utils.Exit(1)
-}
-
-func runBuild(buildArgs []string) string {
-	iidfile, err := ioutil.TempFile("/tmp", "dive.*.iid")
+	events.message(utils.TitleFormat("Analyzing image..."))
+	analysis, err := img.Analyze()
 	if err != nil {
-		utils.Cleanup()
-		log.Fatal(err)
-	}
-	defer os.Remove(iidfile.Name())
-
-	allArgs := append([]string{"--iidfile", iidfile.Name()}, buildArgs...)
-	err = utils.RunDockerCmd("build", allArgs...)
-	if err != nil {
-		utils.Cleanup()
-		log.Fatal(err)
+		events.exitWithErrorMessage("cannot analyze image", err)
+		return
 	}
 
-	imageId, err := ioutil.ReadFile(iidfile.Name())
-	if err != nil {
-		utils.Cleanup()
-		log.Fatal(err)
+	if doExport {
+		events.message(utils.TitleFormat(fmt.Sprintf("Exporting image to '%s'...", options.ExportFile)))
+		bytes, err := export.NewExport(analysis).Marshal()
+		if err != nil {
+			events.exitWithErrorMessage("cannot marshal export payload", err)
+			return
+		}
+
+		file, err := filesystem.OpenFile(options.ExportFile, os.O_RDWR|os.O_CREATE, 0644)
+		if err != nil {
+			events.exitWithErrorMessage("cannot open export file", err)
+			return
+		}
+		defer file.Close()
+
+		_, err = file.Write(bytes)
+		if err != nil {
+			events.exitWithErrorMessage("cannot write to export file", err)
+		}
+		return
 	}
 
-	return string(imageId)
+	if options.Ci {
+		events.message(fmt.Sprintf("  efficiency: %2.4f %%", analysis.Efficiency*100))
+		events.message(fmt.Sprintf("  wastedBytes: %d bytes (%s)", analysis.WastedBytes, humanize.Bytes(analysis.WastedBytes)))
+		events.message(fmt.Sprintf("  userWastedPercent: %2.4f %%", analysis.WastedUserPercent*100))
+
+		evaluator := ci.NewCiEvaluator(options.CiConfig)
+		pass := evaluator.Evaluate(analysis)
+		events.message(evaluator.Report())
+
+		if !pass {
+			events.exitWithError(nil)
+		}
+
+		return
+
+	} else {
+		events.message(utils.TitleFormat("Building cache..."))
+		treeStack := filetree.NewComparer(analysis.RefTrees)
+		errors := treeStack.BuildCache()
+		if errors != nil {
+			for _, err := range errors {
+				events.message("  " + err.Error())
+			}
+			if !options.IgnoreErrors {
+				events.exitWithError(fmt.Errorf("file tree has path errors (use '--ignore-errors' to attempt to continue)"))
+				return
+			}
+		}
+
+		if enableUi {
+			// it appears there is a race condition where termbox.Init() will
+			// block nearly indefinitely when running as the first process in
+			// a Docker container when started within ~25ms of container startup.
+			// I can't seem to determine the exact root cause, however, a large
+			// enough sleep will prevent this behavior (todo: remove this hack)
+			time.Sleep(100 * time.Millisecond)
+
+			err = ui.Run(analysis, treeStack)
+			if err != nil {
+				events.exitWithError(err)
+				return
+			}
+		}
+	}
 }
 
 func Run(options Options) {
-	doExport := options.ExportFile != ""
-	doBuild := len(options.BuildArgs) > 0
-	isCi, _ := strconv.ParseBool(os.Getenv("CI"))
+	var exitCode int
+	var events = make(eventChannel)
 
-	if doBuild {
-		fmt.Println(title("Building image..."))
-		options.ImageId = runBuild(options.BuildArgs)
-	}
-
-	analyzer := image.GetAnalyzer(options.ImageId)
-
-	fmt.Println(title("Fetching image...") + " (this can take a while with large images)")
-	reader, err := analyzer.Fetch()
+	imageResolver, err := dive.GetImageResolver(options.Source)
 	if err != nil {
-		fmt.Printf("cannot fetch image: %v\n", err)
-		utils.Exit(1)
-	}
-	defer reader.Close()
-
-	fmt.Println(title("Parsing image..."))
-	err = analyzer.Parse(reader)
-	if err != nil {
-		fmt.Printf("cannot parse image: %v\n", err)
-		utils.Exit(1)
+		message := "cannot determine image provider"
+		logrus.Error(message)
+		logrus.Error(err)
+		fmt.Fprintf(os.Stderr, "%s: %+v\n", message, err)
+		os.Exit(1)
 	}
 
-	if doExport {
-		fmt.Println(title(fmt.Sprintf("Analyzing image... (export to '%s')", options.ExportFile)))
-	} else {
-		fmt.Println(title("Analyzing image..."))
-	}
+	go run(true, options, imageResolver, events, afero.NewOsFs())
 
-	result, err := analyzer.Analyze()
-	if err != nil {
-		fmt.Printf("cannot analyze image: %v\n", err)
-		utils.Exit(1)
-	}
-
-	if doExport {
-		err = newExport(result).toFile(options.ExportFile)
-		if err != nil {
-			fmt.Printf("cannot write export file: %v\n", err)
-			utils.Exit(1)
-		}
-	}
-
-	if isCi {
-		runCi(result, options)
-	} else {
-		if doExport {
-			utils.Exit(0)
+	for event := range events {
+		if event.stdout != "" {
+			fmt.Println(event.stdout)
 		}
 
-		fmt.Println(title("Building cache..."))
-		cache := filetree.NewFileTreeCache(result.RefTrees)
-		cache.Build()
+		if event.stderr != "" {
+			_, err := fmt.Fprintln(os.Stderr, event.stderr)
+			if err != nil {
+				fmt.Println("error: could not write to buffer:", err)
+			}
+		}
 
-		ui.Run(result, cache)
+		if event.err != nil {
+			logrus.Error(event.err)
+			_, err := fmt.Fprintln(os.Stderr, event.err.Error())
+			if err != nil {
+				fmt.Println("error: could not write to buffer:", err)
+			}
+		}
+
+		if event.errorOnExit {
+			exitCode = 1
+		}
 	}
+	os.Exit(exitCode)
 }

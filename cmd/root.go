@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"fmt"
+	"github.com/wagoodman/dive/dive"
+	"github.com/wagoodman/dive/dive/filetree"
 	"io/ioutil"
 	"os"
 	"path"
@@ -11,13 +13,13 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
-	"github.com/wagoodman/dive/filetree"
-	"github.com/wagoodman/dive/utils"
 )
 
 var cfgFile string
 var exportFile string
 var ciConfigFile string
+var ciConfig = viper.New()
+var isCi bool
 
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
@@ -33,29 +35,46 @@ the amount of wasted space and identifies the offending files from the image.`,
 func Execute() {
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
-		utils.Exit(1)
+		os.Exit(1)
 	}
-	utils.Cleanup()
 }
 
 func init() {
+	initCli()
 	cobra.OnInitialize(initConfig)
+}
 
+func initCli() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.dive.yaml, ~/.config/dive/*.yaml, or $XDG_CONFIG_HOME/dive.yaml)")
+	rootCmd.PersistentFlags().String("source", "docker", "The container engine to fetch the image from. Allowed values: "+strings.Join(dive.ImageSources, ", "))
 	rootCmd.PersistentFlags().BoolP("version", "v", false, "display version number")
-
+	rootCmd.PersistentFlags().BoolP("ignore-errors", "i", false, "ignore image parsing errors and run the analysis anyway")
+	rootCmd.Flags().BoolVar(&isCi, "ci", false, "Skip the interactive TUI and validate against CI rules (same as env var CI=true)")
 	rootCmd.Flags().StringVarP(&exportFile, "json", "j", "", "Skip the interactive TUI and write the layer analysis statistics to a given file.")
 	rootCmd.Flags().StringVar(&ciConfigFile, "ci-config", ".dive-ci", "If CI=true in the environment, use the given yaml to drive validation rules.")
+
+	rootCmd.Flags().String("lowestEfficiency", "0.9", "(only valid with --ci given) lowest allowable image efficiency (as a ratio between 0-1), otherwise CI validation will fail.")
+	rootCmd.Flags().String("highestWastedBytes", "disabled", "(only valid with --ci given) highest allowable bytes wasted, otherwise CI validation will fail.")
+	rootCmd.Flags().String("highestUserWastedPercent", "0.1", "(only valid with --ci given) highest allowable percentage of bytes wasted (as a ratio between 0-1), otherwise CI validation will fail.")
+
+	for _, key := range []string{"lowestEfficiency", "highestWastedBytes", "highestUserWastedPercent"} {
+		if err := ciConfig.BindPFlag(fmt.Sprintf("rules.%s", key), rootCmd.Flags().Lookup(key)); err != nil {
+			log.Fatalf("Unable to bind '%s' flag: %v", key, err)
+		}
+	}
+
+	if err := ciConfig.BindPFlag("ignore-errors", rootCmd.PersistentFlags().Lookup("ignore-errors")); err != nil {
+		log.Fatalf("Unable to bind 'ignore-errors' flag: %v", err)
+	}
 }
 
 // initConfig reads in config file and ENV variables if set.
 func initConfig() {
-	filepathToCfg := getCfgFile(cfgFile)
-	viper.SetConfigFile(filepathToCfg)
+	var err error
 
 	viper.SetDefault("log.level", log.InfoLevel.String())
 	viper.SetDefault("log.path", "./dive.log")
-	viper.SetDefault("log.enabled", true)
+	viper.SetDefault("log.enabled", false)
 	// keybindings: status view / global
 	viper.SetDefault("keybinding.quit", "ctrl+c")
 	viper.SetDefault("keybinding.toggle-view", "tab")
@@ -70,7 +89,7 @@ func initConfig() {
 	viper.SetDefault("keybinding.toggle-added-files", "ctrl+a")
 	viper.SetDefault("keybinding.toggle-removed-files", "ctrl+r")
 	viper.SetDefault("keybinding.toggle-modified-files", "ctrl+m")
-	viper.SetDefault("keybinding.toggle-unchanged-files", "ctrl+u")
+	viper.SetDefault("keybinding.toggle-unmodified-files", "ctrl+u")
 	viper.SetDefault("keybinding.page-up", "pgup")
 	viper.SetDefault("keybinding.page-down", "pgdn")
 
@@ -82,11 +101,34 @@ func initConfig() {
 	viper.SetDefault("filetree.pane-width", 0.5)
 	viper.SetDefault("filetree.show-attributes", true)
 
-	viper.AutomaticEnv() // read in environment variables that match
+	viper.SetDefault("container-engine", "docker")
+	viper.SetDefault("ignore-errors", false)
 
-	// If a config file is found, read it in.
-	if err := viper.ReadInConfig(); err == nil {
+	err = viper.BindPFlag("source", rootCmd.PersistentFlags().Lookup("source"))
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+
+	viper.SetEnvPrefix("DIVE")
+	// replace all - with _ when looking for matching environment variables
+	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
+	viper.AutomaticEnv()
+
+	// if config files are present, load them
+	if cfgFile == "" {
+		// default configs are ignored if not found
+		filepathToCfg := getDefaultCfgFile()
+		viper.SetConfigFile(filepathToCfg)
+	} else {
+		viper.SetConfigFile(cfgFile)
+	}
+	err = viper.ReadInConfig()
+	if err == nil {
 		fmt.Println("Using config file:", viper.ConfigFileUsed())
+	} else if cfgFile != "" {
+		fmt.Println(err)
+		os.Exit(0)
 	}
 
 	// set global defaults (for performance)
@@ -100,6 +142,7 @@ func initLogging() {
 
 	if viper.GetBool("log.enabled") {
 		logFileObj, err = os.OpenFile(viper.GetString("log.path"), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
+		log.SetOutput(logFileObj)
 	} else {
 		log.SetOutput(ioutil.Discard)
 	}
@@ -118,22 +161,21 @@ func initLogging() {
 	}
 
 	log.SetLevel(level)
-	log.SetOutput(logFileObj)
 	log.Debug("Starting Dive...")
+	log.Debugf("config filepath: %s", viper.ConfigFileUsed())
+	for k, v := range viper.AllSettings() {
+		log.Debug("config value: ", k, " : ", v)
+	}
 }
 
-// getCfgFile checks for config file in paths from xdg specs
+// getDefaultCfgFile checks for config file in paths from xdg specs
 // and in $HOME/.config/dive/ directory
 // defaults to $HOME/.dive.yaml
-func getCfgFile(fromFlag string) string {
-	if fromFlag != "" {
-		return fromFlag
-	}
-
+func getDefaultCfgFile() string {
 	home, err := homedir.Dir()
 	if err != nil {
 		fmt.Println(err)
-		utils.Exit(0)
+		os.Exit(0)
 	}
 
 	xdgHome := os.Getenv("XDG_CONFIG_HOME")

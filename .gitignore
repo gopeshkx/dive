@@ -1,4 +1,5 @@
 /.idea
+/bin 
 
 # Binaries for programs and plugins
 *.exe
@@ -20,3 +21,4 @@
 *.log
 /dist
 .cover
+coverage.txt

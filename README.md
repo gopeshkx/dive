@@ -1,8 +1,9 @@
 # dive
 [![Go Report Card](https://goreportcard.com/badge/github.com/wagoodman/dive)](https://goreportcard.com/report/github.com/wagoodman/dive)
-[![Pipeline Status](https://api.travis-ci.org/wagoodman/dive.svg?branch=master)](https://travis-ci.org/wagoodman/dive)
+[![Pipeline Status](https://circleci.com/gh/wagoodman/dive.svg?style=svg)](https://circleci.com/gh/wagoodman/dive)
+[![Donate](https://img.shields.io/badge/Donate-PayPal-green.svg?style=flat)](https://www.paypal.me/wagoodman)
 
-**A tool for exploring a docker image, layer contents, and discovering ways to shrink your Docker image size.**
+**A tool for exploring a docker image, layer contents, and discovering ways to shrink the size of your Docker/OCI image.**
 
 ![Image](.data/demo.gif)
 
@@ -16,11 +17,10 @@ or if you want to build your image then jump straight into analyzing it:
 dive build -t <some-tag> .
 ```
 
-Building on Macbook
+Building on Macbook (supporting only the Docker container engine)
 
 ```bash
 docker run --rm -it \
-      -v /usr/local/bin/docker:/bin/docker \
       -v /var/run/docker.sock:/var/run/docker.sock \
       -v  "$(pwd)":"$(pwd)" \
       -w "$(pwd)" \
@@ -41,22 +41,15 @@ CI=true dive <your-image>
 
 **Show Docker image contents broken down by layer**
 
-As you select a layer on the left, you are shown the contents of that layer
-combined with all previous layers on the right. Also, you can fully explore the
-file tree with the arrow keys.
+As you select a layer on the left, you are shown the contents of that layer combined with all previous layers on the right. Also, you can fully explore the file tree with the arrow keys.
 
 **Indicate what's changed in each layer**
 
-Files that have changed, been modified, added, or removed are indicated in the
-file tree. This can be adjusted to show changes for a specific layer, or
-aggregated changes up to this layer.
+Files that have changed, been modified, added, or removed are indicated in the file tree. This can be adjusted to show changes for a specific layer, or aggregated changes up to this layer.
 
 **Estimate "image efficiency"**
 
-The lower left pane shows basic layer info and an experimental metric that will
-guess how much wasted space your image contains. This might be from duplicating
-files across layers, moving files across layers, or not fully removing files.
-Both a percentage "score" and total wasted file space is provided.
+The lower left pane shows basic layer info and an experimental metric that will guess how much wasted space your image contains. This might be from duplicating files across layers, moving files across layers, or not fully removing files. Both a percentage "score" and total wasted file space is provided.
 
 **Quick build/analysis cycles**
 
@@ -67,21 +60,37 @@ You only need to replace your `docker build` command with the same `dive build`
 command.
 
 **CI Integration**
+
 Analyze and image and get a pass/fail result based on the image efficiency and wasted space. Simply set `CI=true` in the environment when invoking any valid dive command.
 
+**Multiple Image Sources and Container Engines Supported**
+
+With the `--source` option, you can select where to fetch the container image from:
+```bash
+dive <your-image> --source <source>
+```
+or
+```bash
+dive <source>://<your-image>
+```
+
+With valid `source` options as such:
+- `docker`: Docker engine (the default option)
+- `docker-archive`: A Docker Tar Archive from disk
+- `podman`: Podman engine (linux only)
 
 ## Installation
 
 **Ubuntu/Debian**
 ```bash
-wget https://github.com/wagoodman/dive/releases/download/v0.7.0/dive_0.7.0_linux_amd64.deb
-sudo apt install ./dive_0.7.0_linux_amd64.deb
+wget https://github.com/wagoodman/dive/releases/download/v0.9.2/dive_0.9.2_linux_amd64.deb
+sudo apt install ./dive_0.9.2_linux_amd64.deb
 ```
 
 **RHEL/Centos**
 ```bash
-curl -OL https://github.com/wagoodman/dive/releases/download/v0.7.0/dive_0.7.0_linux_amd64.rpm
-rpm -i dive_0.7.0_linux_amd64.rpm
+curl -OL https://github.com/wagoodman/dive/releases/download/v0.9.2/dive_0.9.2_linux_amd64.rpm
+rpm -i dive_0.9.2_linux_amd64.rpm
 ```
 
 **Arch Linux**
@@ -93,21 +102,21 @@ yay -S dive
 ```
 
 The above example assumes [`yay`](https://aur.archlinux.org/packages/yay/) as the tool for installing AUR packages.
-*Note*: the AUR repository is **not** controlled by the dive project maintainer. 
 
 **Mac**
+
 ```bash
-brew tap wagoodman/dive
 brew install dive
 ```
-or download the latest Darwin build from the [releases page](https://github.com/wagoodman/dive/releases/download/v0.7.0/dive_0.7.0_darwin_amd64.tar.gz).
+
+or download the latest Darwin build from the [releases page](https://github.com/wagoodman/dive/releases/download/v0.9.2/dive_0.9.2_darwin_amd64.tar.gz).
 
 **Windows**
 
-Download the [latest release](https://github.com/wagoodman/dive/releases/download/v0.7.0/dive_0.7.0_windows_amd64.zip).
+Download the [latest release](https://github.com/wagoodman/dive/releases/download/v0.9.2/dive_0.9.2_windows_amd64.zip).
 
 **Go tools**
-Requires Go version 1.9 or higher.
+Requires Go version 1.10 or higher.
 
 ```bash
 go get github.com/wagoodman/dive
@@ -119,13 +128,13 @@ go get github.com/wagoodman/dive
 docker pull wagoodman/dive
 ```
 
-or 
+or
 
 ```bash
 docker pull quay.io/wagoodman/dive
 ```
 
-When running you'll need to include the docker client binary and socket file:
+When running you'll need to include the docker socket file:
 ```bash
 docker run --rm -it \
     -v /var/run/docker.sock:/var/run/docker.sock \
@@ -142,12 +151,12 @@ docker run --rm -it `
 **Note:** depending on the version of docker you are running locally you may need to specify the docker API version as an environment variable:
 ```bash
    DOCKER_API_VERSION=1.37 dive ...
-``` 
+```
 or if you are running with a docker image:
 ```bash
 docker run --rm -it \
     -v /var/run/docker.sock:/var/run/docker.sock \
-    -e DOCKER_API_VERSION=1.37
+    -e DOCKER_API_VERSION=1.37 \
     wagoodman/dive:latest <dive arguments...>
 ```
 
@@ -157,7 +166,7 @@ When running dive with the environment variable `CI=true` then the dive UI will 
 ```
 rules:
   # If the efficiency is measured below X%, mark as failed.
-  # Expressed as a percentage between 0-1.
+  # Expressed as a ratio between 0-1.
   lowestEfficiency: 0.95
 
   # If the amount of wasted space is at least X or larger than X, mark as failed.
@@ -166,7 +175,7 @@ rules:
 
   # If the amount of wasted space makes up for X% or more of the image, mark as failed.
   # Note: the base image layer is NOT included in the total image size.
-  # Expressed as a percentage between 0-1; fails if the threshold is met or crossed.
+  # Expressed as a ratio between 0-1; fails if the threshold is met or crossed.
   highestUserWastedPercent: 0.20
 ```
 You can override the CI config path with the `--ci-config` option.
@@ -189,11 +198,17 @@ Key Binding                                | Description
 <kbd>Ctrl + M</kbd>                        | Filetree view: show/hide modified files
 <kbd>Ctrl + U</kbd>                        | Filetree view: show/hide unmodified files
 <kbd>Ctrl + B</kbd>                        | Filetree view: show/hide file attributes
+<kbd>PageUp</kbd>                          | Filetree view: scroll up a page
+<kbd>PageDown</kbd>                        | Filetree view: scroll down a page
 
 ## UI Configuration
 
 No configuration is necessary, however, you can create a config file and override values:
 ```yaml
+# supported options are "docker" and "podman"
+container-engine: docker
+# continue with analysis even if there are errors parsing the image archive
+ignore-errors: false
 log:
   enabled: true
   path: ./dive.log
@@ -207,7 +222,7 @@ keybinding:
   toggle-view: tab
   filter-files: ctrl+f, ctrl+slash
 
-  # Layer view specific bindings  
+  # Layer view specific bindings
   compare-all: ctrl+a
   compare-layer: ctrl+l
 
@@ -221,14 +236,14 @@ keybinding:
   toggle-filetree-attributes: ctrl+b
   page-up: pgup
   page-down: pgdn
-  
+
 diff:
-  # You can change the default files show in the filetree (right pane). All diff types are shown by default. 
+  # You can change the default files show in the filetree (right pane). All diff types are shown by default.
   hide:
     - added
     - removed
-    - changed
-    - unchanged
+    - modified
+    - unmodified
 
 filetree:
   # The default directory-collapse state
@@ -236,7 +251,7 @@ filetree:
 
   # The percentage of screen width the filetree should take on the screen (must be >0 and <1)
   pane-width: 0.5
-  
+
   # Show the file attributes next to the filetree
   show-attributes: true
 

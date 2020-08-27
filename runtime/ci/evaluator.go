@@ -1,78 +1,117 @@
 package ci
 
 import (
-	"bytes"
 	"fmt"
-	"github.com/logrusorgru/aurora"
-	"github.com/spf13/viper"
-	"github.com/wagoodman/dive/image"
-	"io/ioutil"
+	"github.com/dustin/go-humanize"
+	"github.com/wagoodman/dive/dive/image"
+	"github.com/wagoodman/dive/utils"
 	"sort"
+	"strconv"
 	"strings"
+
+	"github.com/spf13/viper"
+
+	"github.com/logrusorgru/aurora"
 )
 
-func NewEvaluator() *Evaluator {
-	ciConfig := viper.New()
-	ciConfig.SetConfigType("yaml")
+type CiEvaluator struct {
+	Rules            []CiRule
+	Results          map[string]RuleResult
+	Tally            ResultTally
+	Pass             bool
+	Misconfigured    bool
+	InefficientFiles []ReferenceFile
+}
 
-	ciConfig.SetDefault("rules.lowestEfficiency", 0.9)
-	ciConfig.SetDefault("rules.highestWastedBytes", "disabled")
-	ciConfig.SetDefault("rules.highestUserWastedPercent", 0.1)
+type ResultTally struct {
+	Pass  int
+	Fail  int
+	Skip  int
+	Warn  int
+	Total int
+}
 
-	return &Evaluator{
-		Config:  ciConfig,
-		Rules:   loadCiRules(),
+func NewCiEvaluator(config *viper.Viper) *CiEvaluator {
+	return &CiEvaluator{
+		Rules:   loadCiRules(config),
 		Results: make(map[string]RuleResult),
 		Pass:    true,
 	}
 }
 
-func (ci *Evaluator) LoadConfig(configFile string) error {
-	fileBytes, err := ioutil.ReadFile(configFile)
-	if err != nil {
-		return err
-	}
-
-	err = ci.Config.ReadConfig(bytes.NewBuffer(fileBytes))
-	if err != nil {
-		return err
-	}
-	return nil
+func (ci *CiEvaluator) isRuleEnabled(rule CiRule) bool {
+	return rule.Configuration() != "disabled"
 }
 
-func (ci *Evaluator) isRuleEnabled(rule Rule) bool {
-	value := ci.Config.GetString(rule.Key())
-	if value == "disabled" {
-		return false
-	}
-	return true
-}
-
-func (ci *Evaluator) Evaluate(analysis *image.AnalysisResult) bool {
+func (ci *CiEvaluator) Evaluate(analysis *image.AnalysisResult) bool {
+	canEvaluate := true
 	for _, rule := range ci.Rules {
-		if ci.isRuleEnabled(rule) {
-
-			value := ci.Config.GetString(rule.Key())
-			status, message := rule.Evaluate(analysis, value)
-
-			if _, exists := ci.Results[rule.Key()]; exists {
-				panic(fmt.Errorf("CI rule result recorded twice: %s", rule.Key()))
-			}
-
-			if status == RuleFailed {
-				ci.Pass = false
-			}
-
+		if !ci.isRuleEnabled(rule) {
 			ci.Results[rule.Key()] = RuleResult{
-				status:  status,
-				message: message,
+				status:  RuleConfigured,
+				message: "rule disabled",
 			}
+			continue
+		}
+
+		err := rule.Validate()
+		if err != nil {
+			ci.Results[rule.Key()] = RuleResult{
+				status:  RuleMisconfigured,
+				message: err.Error(),
+			}
+			canEvaluate = false
 		} else {
+			ci.Results[rule.Key()] = RuleResult{
+				status:  RuleConfigured,
+				message: "test",
+			}
+		}
+
+	}
+
+	if !canEvaluate {
+		ci.Pass = false
+		ci.Misconfigured = true
+		return ci.Pass
+	}
+
+	// capture inefficient files
+	for idx := 0; idx < len(analysis.Inefficiencies); idx++ {
+		fileData := analysis.Inefficiencies[len(analysis.Inefficiencies)-1-idx]
+
+		ci.InefficientFiles = append(ci.InefficientFiles, ReferenceFile{
+			References: len(fileData.Nodes),
+			SizeBytes:  uint64(fileData.CumulativeSize),
+			Path:       fileData.Path,
+		})
+	}
+
+	// evaluate results against the configured CI rules
+	for _, rule := range ci.Rules {
+		if !ci.isRuleEnabled(rule) {
 			ci.Results[rule.Key()] = RuleResult{
 				status:  RuleDisabled,
 				message: "rule disabled",
 			}
+			continue
 		}
+
+		status, message := rule.Evaluate(analysis)
+
+		if value, exists := ci.Results[rule.Key()]; exists && value.status != RuleConfigured && value.status != RuleMisconfigured {
+			panic(fmt.Errorf("CI rule result recorded twice: %s", rule.Key()))
+		}
+
+		if status == RuleFailed {
+			ci.Pass = false
+		}
+
+		ci.Results[rule.Key()] = RuleResult{
+			status:  status,
+			message: message,
+		}
+
 	}
 
 	ci.Tally.Total = len(ci.Results)
@@ -94,7 +133,23 @@ func (ci *Evaluator) Evaluate(analysis *image.AnalysisResult) bool {
 	return ci.Pass
 }
 
-func (ci *Evaluator) Report() {
+func (ci *CiEvaluator) Report() string {
+	var sb strings.Builder
+	fmt.Fprintln(&sb, utils.TitleFormat("Inefficient Files:"))
+
+	template := "%5s  %12s  %-s\n"
+	fmt.Fprintf(&sb, template, "Count", "Wasted Space", "File Path")
+
+	if len(ci.InefficientFiles) == 0 {
+		fmt.Fprintln(&sb, "None")
+	} else {
+		for _, file := range ci.InefficientFiles {
+			fmt.Fprintf(&sb, template, strconv.Itoa(file.References), humanize.Bytes(file.SizeBytes), file.Path)
+		}
+	}
+
+	fmt.Fprintln(&sb, utils.TitleFormat("Results:"))
+
 	status := "PASS"
 
 	rules := make([]string, 0, len(ci.Results))
@@ -111,18 +166,24 @@ func (ci *Evaluator) Report() {
 		result := ci.Results[rule]
 		name := strings.TrimPrefix(rule, "rules.")
 		if result.message != "" {
-			fmt.Printf("  %s: %s: %s\n", result.status.String(), name, result.message)
+			fmt.Fprintf(&sb, "  %s: %s: %s\n", result.status.String(), name, result.message)
 		} else {
-			fmt.Printf("  %s: %s\n", result.status.String(), name)
+			fmt.Fprintf(&sb, "  %s: %s\n", result.status.String(), name)
 		}
 	}
 
-	summary := fmt.Sprintf("Result:%s [Total:%d] [Passed:%d] [Failed:%d] [Warn:%d] [Skipped:%d]", status, ci.Tally.Total, ci.Tally.Pass, ci.Tally.Fail, ci.Tally.Warn, ci.Tally.Skip)
-	if ci.Pass {
-		fmt.Println(aurora.Green(summary))
-	} else if ci.Pass && ci.Tally.Warn > 0 {
-		fmt.Println(aurora.Blue(summary))
+	if ci.Misconfigured {
+		fmt.Fprintln(&sb, aurora.Red("CI Misconfigured"))
+
 	} else {
-		fmt.Println(aurora.Red(summary))
+		summary := fmt.Sprintf("Result:%s [Total:%d] [Passed:%d] [Failed:%d] [Warn:%d] [Skipped:%d]", status, ci.Tally.Total, ci.Tally.Pass, ci.Tally.Fail, ci.Tally.Warn, ci.Tally.Skip)
+		if ci.Pass {
+			fmt.Fprintln(&sb, aurora.Green(summary))
+		} else if ci.Pass && ci.Tally.Warn > 0 {
+			fmt.Fprintln(&sb, aurora.Blue(summary))
+		} else {
+			fmt.Fprintln(&sb, aurora.Red(summary))
+		}
 	}
+	return sb.String()
 }
